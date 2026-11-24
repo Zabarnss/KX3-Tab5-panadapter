@@ -4,6 +4,8 @@
 
 This is a panadapter for the Elecraft KX3 transceiver that utilizes an inexpensive M5Stack Tab5 IOT development platform. This project was inspired by the QMX panadapter created by Steffen Lav [https://github.com/SteffenLav/qmx-panadapter ](url). Steffen's project is extensive and much more than just a panadapter. My goal in this project for the KX3 is a simple, easy to use panadapter for viewing signals on the band. Unfortunately, the KX3 does not have a USB port nor its digital audio stream (which makes Steffen's QMX panadapter so elegant), as such, putting together this system for the KX3 requires an external USB audio sound interface and a USB hub, in addition to Tab5. 
 
+<img width="1536" height="1024" alt="Tab5 and Elecraft KX3 Connection Diagram" src="https://github.com/user-attachments/assets/6ce4258a-9f8d-4f1f-b06c-5822a6d41e9c" />
+
 ## Overview
 
 The KX3 Panadapter is an external real-time spectrum display designed to work with the Elecraft KX3 transceiver and the M5Stack Tab5 development platform. It uses the KX3's quadrature (I/Q) audio output to display a spectrum of the received RF signals surrounding the current receive frequency.

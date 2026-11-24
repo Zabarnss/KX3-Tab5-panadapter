@@ -1,0 +1,10 @@
+menu "KX3 Tab5 Panadapter"
+
+    config KX3_USB_HOST_START_DELAY_MS
+        int "Delay before USB host powers the port (ms)"
+        range 0 5000
+        default 500
+        help
+            Delay between host initialization and enabling the Tab5 USB-A 5 V supply.
+
+endmenu

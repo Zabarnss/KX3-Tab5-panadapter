@@ -1,0 +1,19 @@
+dependencies:
+  # M5Stack Tab5 board support and ESPP framework components.
+  espp/m5stack-tab5: "1.4.6"
+  espp/display: "1.4.3"
+  espp/logger: "1.4.3"
+  espp/task: "1.4.3"
+  espp/format: "1.4.3"
+
+  # Espressif USB host stack and class drivers.
+  espressif/usb: "1.6.0"
+  espressif/usb_host_uac: "1.5.0"
+  espressif/usb_host_ch34x_vcp: "2.2.1"
+  espressif/usb_host_cdc_acm: "2.4.1"
+  espressif/usb_host_ftdi_vcp: "2.1.1"
+  espressif/usb_host_hid: "1.2.1"
+
+  # LVGL is resolved as a transitive dependency of the ESPP display stack.
+  # The original development environment used LVGL 9.6.0-dev; see README
+  # for the version compatibility note before publishing a generated lockfile.

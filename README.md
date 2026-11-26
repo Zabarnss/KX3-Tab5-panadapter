@@ -225,6 +225,6 @@ The primary goals are to:
 
 ## Status
 
-This project is under active development. The v1.6.32 application baseline has been confirmed by the developer to build and run on the M5Stack Tab5 using the dependency versions recorded in this repository. A separate fresh-clone build has not yet been independently verified.
+This project is under active development. The application has been confirmed by the developer to build and run on the M5Stack Tab5 using the dependency versions recorded in this repository. A separate fresh-clone build has not yet been independently verified.
 
 Hardware compatibility, USB audio interface support, signal processing, user-interface functionality, and performance may continue to evolve. Contributions and reports about additional compatible USB audio interfaces are welcome.

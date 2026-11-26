@@ -1,3 +1,4 @@
+// Settings: add persistent UCA222 I/Q fractional-delay correction toggle.
 // v1.6.24: show LVGL charging symbol beside battery voltage while charging.
 // v1.6.29: separate charging-symbol label; visibility updates independently of battery text.
 // v1.6.30: replace font glyph with custom LVGL-drawn lightning bolt.
@@ -296,6 +297,18 @@ constexpr uint32_t TOUCH_TUNE_HOLD_MS = 300;
 // Set by the CAT task when VFO A changes; consumed by the LVGL/UI task.
 std::atomic<bool> s_frequency_change_pending{false};
 uint32_t s_active_rate = 0;
+// A one-sample channel offset is implemented as a near-one-sample
+// first-order Thiran all-pass delay. +1 delays I relative to Q; -1 delays Q
+// relative to I; 0 leaves both channels untouched. The measured UCA222
+// correction is 20.793 us (0.998064 samples at 48 kHz).
+constexpr double IQ_SAMPLE_OFFSET_DELAY_SECONDS = 20.793e-6;
+static bool s_iq_sample_offset_available = false; // True while a stereo UAC1 stream is active.
+static std::atomic<int> s_iq_sample_offset_requested{0};
+static double s_iq_sample_offset_coefficient = 0.0;
+static float s_i_delay_x1 = 0.0f;
+static float s_i_delay_y1 = 0.0f;
+static float s_q_delay_x1 = 0.0f;
+static float s_q_delay_y1 = 0.0f;
 
 constexpr size_t FFT_SIZE = 1024;
 // LVGL chart resolution: fewer points than the FFT, while retaining the full FFT for DSP.
@@ -345,10 +358,11 @@ struct DisplaySettings {
     int pan_high_db = -20;
     int waterfall_low_db = -95;
     int waterfall_high_db = -35;
-    float averaging_seconds = 0.2f;
+    float averaging_seconds = 0.3f;
     int display_width_khz = 48;
-    int waterfall_speed_hz = 40; // Waterfall history rows per second (30-60 Hz).
+    int waterfall_speed_hz = 40; // Waterfall history rows per second (20-60 Hz).
     int uac2_input_gain_db = 0;  // Applied only to UAC2/Xonar PCM; UAC1 remains unchanged.
+    int iq_sample_offset = 0; // -1, 0, or +1; +1 delays I, -1 delays Q.
 };
 DisplaySettings s_settings{};
 bool s_settings_nvs_ready = false;
@@ -376,6 +390,23 @@ void load_persistent_audio_settings() {
     }
     s_settings_nvs_ready = true;
 
+    int32_t saved_sample_offset = 0;
+    err = nvs_get_i32(handle, "iq_sample_off", &saved_sample_offset);
+    if (err == ESP_OK) {
+        s_settings.iq_sample_offset = std::clamp(static_cast<int>(saved_sample_offset), -1, 1);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        // Migrate the previous UCA222 ON/OFF preference: ON becomes +1,
+        // OFF becomes 0. Fresh installations default to 0 (no channel shift).
+        uint8_t legacy_correction = 0;
+        const esp_err_t legacy_err = nvs_get_u8(handle, "uca222_iq_corr", &legacy_correction);
+        if (legacy_err == ESP_OK) s_settings.iq_sample_offset = legacy_correction ? 1 : 0;
+    } else {
+        ESP_LOGW(TAG, "Could not read saved I/Q sample offset (%s); using 0",
+                 esp_err_to_name(err));
+    }
+    s_iq_sample_offset_requested.store(s_settings.iq_sample_offset,
+                                        std::memory_order_relaxed);
+
     int32_t saved_gain_db = 0;
     err = nvs_get_i32(handle, "uac2_gain_db", &saved_gain_db);
     if (err == ESP_OK) {
@@ -400,6 +431,9 @@ void save_persistent_audio_settings() {
         return;
     }
     err = nvs_set_i32(handle, "uac2_gain_db", s_settings.uac2_input_gain_db);
+    if (err == ESP_OK) {
+        err = nvs_set_i32(handle, "iq_sample_off", s_settings.iq_sample_offset);
+    }
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     if (err == ESP_OK) {
@@ -411,6 +445,7 @@ void save_persistent_audio_settings() {
 }
 lv_obj_t *s_settings_panel = nullptr;
 lv_obj_t *s_settings_backdrop = nullptr;
+lv_obj_t *s_iq_offset_buttons[3] = {nullptr, nullptr, nullptr};
 // Modal settings state: pauses FFT/panadapter and waterfall work, but leaves
 // USB audio, CAT communications, LVGL, and touch handling active.
 std::atomic<bool> s_settings_open{false};
@@ -892,6 +927,62 @@ void update_spectrum_chart(uint8_t waterfall_rows) {
         spectrum[n] = {i_samples[n] * window, q_samples[n] * window};
     }
     fft_in_place(spectrum);
+
+    // Temporary UCA222 image-rejection diagnostic. For a single complex-I/Q
+    // carrier, the wanted signal and its image appear at mirrored FFT bins.
+    // Find the strongest mirrored pair (excluding DC and Nyquist guard bins),
+    // then report the stronger member as the wanted signal and the other as
+    // its image. This examines the actual corrected samples, before display
+    // averaging, chart scaling, or waterfall rendering.
+    if (s_iq_sample_offset_available) {
+        static int64_t last_iq_image_log_us = 0;
+        const int64_t diagnostic_now_us = esp_timer_get_time();
+        if (diagnostic_now_us - last_iq_image_log_us >= 2000000) {
+            last_iq_image_log_us = diagnostic_now_us;
+            const float diagnostic_bin_width =
+                static_cast<float>(s_active_rate) / static_cast<float>(FFT_SIZE);
+            float strongest_pair_power = 0.0f;
+            size_t strongest_bin = 0;
+            float positive_peak = 0.0f;
+            float negative_peak = 0.0f;
+            for (size_t k = 2; k < FFT_SIZE / 2 - 1; ++k) {
+                const size_t mirror = FFT_SIZE - k;
+                const float pos_re = spectrum[k].re / window_sum;
+                const float pos_im = spectrum[k].im / window_sum;
+                const float neg_re = spectrum[mirror].re / window_sum;
+                const float neg_im = spectrum[mirror].im / window_sum;
+                const float pos_power = pos_re * pos_re + pos_im * pos_im;
+                const float neg_power = neg_re * neg_re + neg_im * neg_im;
+                const float pair_power = std::max(pos_power, neg_power);
+                if (pair_power > strongest_pair_power) {
+                    strongest_pair_power = pair_power;
+                    strongest_bin = k;
+                    positive_peak = std::sqrt(pos_power);
+                    negative_peak = std::sqrt(neg_power);
+                }
+            }
+            if (strongest_bin != 0) {
+                const bool wanted_is_positive = positive_peak >= negative_peak;
+                const float wanted_amplitude = std::max(positive_peak, negative_peak);
+                const float image_amplitude = std::min(positive_peak, negative_peak);
+                const float wanted_dbfs = 20.0f * std::log10(
+                    std::max(wanted_amplitude, 1.0e-9f));
+                const float image_dbfs = 20.0f * std::log10(
+                    std::max(image_amplitude, 1.0e-9f));
+                const float rejection_db = wanted_dbfs - image_dbfs;
+                const float signed_frequency_hz =
+                    (wanted_is_positive ? 1.0f : -1.0f) *
+                    static_cast<float>(strongest_bin) * diagnostic_bin_width;
+                ESP_LOGI(TAG,
+                         "IQ IMAGE TEST: wanted=%+.1f Hz %.1f dBFS | "
+                         "image=%+.1f Hz %.1f dBFS | rejection=%.1f dB",
+                         signed_frequency_hz, wanted_dbfs,
+                         -signed_frequency_hz, image_dbfs, rejection_db);
+            } else {
+                ESP_LOGI(TAG, "IQ IMAGE TEST: no usable FFT peak found");
+            }
+        }
+    }
 
     // Advance the mirrored circular history. The visible rows remain contiguous
     // for LVGL, avoiding a full-history memmove on every update.
@@ -1434,8 +1525,27 @@ void process_pcm_bytes(const uint8_t *bytes, uint32_t got, bool is_uac2) {
     const float sample_gain = is_uac2
         ? static_cast<float>(std::pow(10.0, static_cast<double>(gain_db) / 20.0))
         : 1.0f;
+    // Measure the raw USB audio samples before any optional software gain.
+    // Emit one compact ADC diagnostic per second for comparing I/Q interfaces.
+    static uint64_t window_samples = 0;
+    static uint64_t clipped_i = 0, clipped_q = 0;
+    static uint64_t near_clip_i = 0, near_clip_q = 0;
+    static int32_t peak_i = 0, peak_q = 0;
+    static TickType_t last_adc_log_tick = 0;
+
     static std::array<float, 1024> chunk_i{};
     static std::array<float, 1024> chunk_q{};
+
+    const int requested_offset = s_iq_sample_offset_available
+        ? s_iq_sample_offset_requested.load(std::memory_order_relaxed) : 0;
+    static int previous_offset = 0;
+    if (requested_offset != previous_offset) {
+        // Reset both filter histories when the selected direction changes.
+        s_i_delay_x1 = s_i_delay_y1 = 0.0f;
+        s_q_delay_x1 = s_q_delay_y1 = 0.0f;
+        previous_offset = requested_offset;
+        ESP_LOGI(TAG, "I/Q sample offset now %+d", requested_offset);
+    }
 
     for (size_t n = 0; n < frames; ++n) {
         const size_t k = 4 * n;
@@ -1443,8 +1553,67 @@ void process_pcm_bytes(const uint8_t *bytes, uint32_t got, bool is_uac2) {
             uint16_t(bytes[k]) | (uint16_t(bytes[k + 1]) << 8));
         const int16_t q = static_cast<int16_t>(
             uint16_t(bytes[k + 2]) | (uint16_t(bytes[k + 3]) << 8));
-        chunk_i[n] = (static_cast<float>(i) / 32768.0f) * sample_gain;
-        chunk_q[n] = (static_cast<float>(q) / 32768.0f) * sample_gain;
+        const int32_t abs_i = (i < 0) ? -static_cast<int32_t>(i) : i;
+        const int32_t abs_q = (q < 0) ? -static_cast<int32_t>(q) : q;
+
+        peak_i = std::max(peak_i, abs_i);
+        peak_q = std::max(peak_q, abs_q);
+        if (i == INT16_MIN || i == INT16_MAX) ++clipped_i;
+        if (q == INT16_MIN || q == INT16_MAX) ++clipped_q;
+        if (abs_i >= 32440) ++near_clip_i; // approximately -0.1 dBFS
+        if (abs_q >= 32440) ++near_clip_q;
+        ++window_samples;
+
+        const float i_sample = static_cast<float>(i) / 32768.0f;
+        float q_sample = static_cast<float>(q) / 32768.0f;
+
+        // +1: delay I relative to Q. -1: delay Q relative to I.
+        // 0: bypass both filters. The all-pass delay is approximately one
+        // sample at 48 kHz and retains state across USB packets.
+        float i_corrected = i_sample;
+        float q_corrected = q_sample;
+        if (!is_uac2 && requested_offset != 0) {
+            const float a = static_cast<float>(s_iq_sample_offset_coefficient);
+            if (requested_offset > 0) {
+                const float filtered_i = a * i_sample + s_i_delay_x1 - a * s_i_delay_y1;
+                s_i_delay_x1 = i_sample;
+                s_i_delay_y1 = filtered_i;
+                i_corrected = filtered_i;
+            } else {
+                const float filtered_q = a * q_sample + s_q_delay_x1 - a * s_q_delay_y1;
+                s_q_delay_x1 = q_sample;
+                s_q_delay_y1 = filtered_q;
+                q_corrected = filtered_q;
+            }
+        }
+
+        chunk_i[n] = i_corrected * sample_gain;
+        chunk_q[n] = q_corrected * sample_gain;
+    }
+
+    const TickType_t adc_now = xTaskGetTickCount();
+    if (last_adc_log_tick == 0) last_adc_log_tick = adc_now;
+    if ((adc_now - last_adc_log_tick) >= pdMS_TO_TICKS(1000)) {
+        const double peak_db_i = 20.0 * std::log10(
+            std::max(static_cast<double>(peak_i) / 32768.0, 1.0e-7));
+        const double peak_db_q = 20.0 * std::log10(
+            std::max(static_cast<double>(peak_q) / 32768.0, 1.0e-7));
+        const double near_i_pct = window_samples
+            ? 100.0 * static_cast<double>(near_clip_i) / window_samples : 0.0;
+        const double near_q_pct = window_samples
+            ? 100.0 * static_cast<double>(near_clip_q) / window_samples : 0.0;
+
+        ESP_LOGI(TAG,
+                 "ADC LEVEL: I peak=%5.1f dBFS | Q peak=%5.1f dBFS | "
+                 "clipped I/Q=%llu/%llu | near-clip I/Q=%.3f%%/%.3f%%",
+                 peak_db_i, peak_db_q,
+                 static_cast<unsigned long long>(clipped_i),
+                 static_cast<unsigned long long>(clipped_q),
+                 near_i_pct, near_q_pct);
+
+        last_adc_log_tick = adc_now;
+        window_samples = clipped_i = clipped_q = near_clip_i = near_clip_q = 0;
+        peak_i = peak_q = 0;
     }
 
     {
@@ -1617,13 +1786,20 @@ void uac_event_task(void *arg) {
             uac_host_dev_info_t info{};
             uac_host_dev_alt_param_t alt{};
             std::string format = "Format details unavailable";
+            s_iq_sample_offset_available = false;
+            s_iq_sample_offset_coefficient = 0.0;
+            s_i_delay_x1 = s_i_delay_y1 = 0.0f;
+            s_q_delay_x1 = s_q_delay_y1 = 0.0f;
             if (uac_host_get_device_info(handle, &info) == ESP_OK) {
-                ESP_LOGD(TAG, "UAC input device VID=%04X PID=%04X",
+                ESP_LOGI(TAG, "UAC input device VID=%04X PID=%04X",
                          info.VID, info.PID);
+                // Sample offset is user-selectable and applies to any stereo
+                // UAC1 interface, not just a particular USB vendor/product.
             }
             if (uac_host_get_device_alt_param(handle, 1, &alt) == ESP_OK) {
                 format = describe_alt(alt);
-                ESP_LOGD(TAG, "First capture alternate setting: %s", format.c_str());
+                ESP_LOGI(TAG, "UAC1 capture alternate-setting capabilities: %s",
+                         format.c_str());
             } else {
                 ESP_LOGW(TAG, "Could not read first capture alternate setting");
             }
@@ -1641,18 +1817,35 @@ void uac_event_task(void *arg) {
                     .sample_freq = rate,
                     .flags = 0,
                 };
-                ESP_LOGD(TAG, "Attempting stereo capture at %lu Hz", (unsigned long)rate);
+                ESP_LOGI(TAG, "Trying UAC1 capture: stereo, 16-bit, %lu Hz",
+                         (unsigned long)rate);
                 err = uac_host_device_start(handle, &stream);
                 if (err == ESP_OK) {
                     s_active_rate = rate;
                     s_averaging_initialized = false;
                     started = true;
+                    ESP_LOGI(TAG,
+                             "UAC1 ACTIVE AUDIO FORMAT: %lu Hz, 2 channels, 16-bit PCM",
+                             (unsigned long)s_active_rate);
                     break;
                 }
                 ESP_LOGW(TAG, "Capture start at %lu Hz failed: %s",
                          (unsigned long)rate, esp_err_to_name(err));
             }
             if (started) {
+                s_iq_sample_offset_available = true;
+                const double delay_samples = IQ_SAMPLE_OFFSET_DELAY_SECONDS *
+                                             static_cast<double>(s_active_rate);
+                s_iq_sample_offset_coefficient =
+                    (1.0 - delay_samples) / (1.0 + delay_samples);
+                s_i_delay_x1 = s_i_delay_y1 = 0.0f;
+                s_q_delay_x1 = s_q_delay_y1 = 0.0f;
+                ESP_LOGI(TAG,
+                         "Stereo UAC1 sample offset ready: one-step delay %.3f us "
+                         "(%.6f samples), Thiran coefficient %.8f; selected offset=%+d",
+                         IQ_SAMPLE_OFFSET_DELAY_SECONDS * 1.0e6, delay_samples,
+                         s_iq_sample_offset_coefficient,
+                         s_iq_sample_offset_requested.load(std::memory_order_relaxed));
                 char fmt[128];
                 std::snprintf(fmt, sizeof(fmt), "Streaming: stereo, 16-bit, %lu Hz",
                               (unsigned long)s_active_rate);
@@ -1773,10 +1966,18 @@ void setting_slider_event(lv_event_t *event) {
         static_cast<lv_obj_t *>(lv_event_get_target(event)));
     switch (control->id) {
     case SettingId::FrequencyOffset: s_settings.frequency_offset_hz = value * 100; break;
-    case SettingId::PanLow:
-        s_settings.pan_low_db = std::min(value, s_settings.pan_high_db - 5); break;
-    case SettingId::PanHigh:
-        s_settings.pan_high_db = std::max(value, s_settings.pan_low_db + 5); break;
+    case SettingId::PanLow: {
+        const int low = std::min(value, s_settings.pan_high_db - 5);
+        s_settings.pan_low_db = low;
+        s_settings.waterfall_low_db = std::min(low, s_settings.waterfall_high_db - 5);
+        break;
+    }
+    case SettingId::PanHigh: {
+        const int high = std::max(value, s_settings.pan_low_db + 5);
+        s_settings.pan_high_db = high;
+        s_settings.waterfall_high_db = std::max(high, s_settings.waterfall_low_db + 5);
+        break;
+    }
     case SettingId::WaterfallLow:
         s_settings.waterfall_low_db = std::min(value, s_settings.waterfall_high_db - 5); break;
     case SettingId::WaterfallHigh:
@@ -1784,7 +1985,7 @@ void setting_slider_event(lv_event_t *event) {
     case SettingId::Averaging: s_settings.averaging_seconds = value / 10.0f; break;
     case SettingId::DisplayWidth: s_settings.display_width_khz = value; break;
     case SettingId::WaterfallSpeed:
-        s_settings.waterfall_speed_hz = std::clamp(value, 30, 60);
+        s_settings.waterfall_speed_hz = std::clamp(value, 20, 60);
         break;
     case SettingId::Uac2InputGain:
         s_settings.uac2_input_gain_db = std::clamp(value, 0, 24);
@@ -1805,7 +2006,7 @@ void add_setting_slider(lv_obj_t *panel, const char *title, SettingId id,
     lv_obj_t *group = lv_obj_create(panel);
     lv_obj_remove_style_all(group);
     lv_obj_set_width(group, LV_PCT(100));
-    lv_obj_set_height(group, 62);
+    lv_obj_set_height(group, 58);
     lv_obj_set_flex_flow(group, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(group, 0, 0);
     lv_obj_set_style_pad_row(group, 1, 0);
@@ -1865,6 +2066,36 @@ void add_setting_slider(lv_obj_t *panel, const char *title, SettingId id,
     s_setting_controls[control_index] = {id, value, slider};
     lv_obj_add_event_cb(slider, setting_slider_event, LV_EVENT_VALUE_CHANGED,
                         &s_setting_controls[control_index]);
+}
+
+void update_iq_offset_button_styles() {
+    for (int i = 0; i < 3; ++i) {
+        if (!s_iq_offset_buttons[i]) continue;
+        const bool selected = (i - 1) == s_settings.iq_sample_offset;
+        lv_obj_set_style_bg_color(s_iq_offset_buttons[i],
+                                  lv_color_hex(selected ? 0x087A35 : 0x29445C), 0);
+        lv_obj_set_style_bg_grad_color(s_iq_offset_buttons[i],
+                                       lv_color_hex(selected ? 0x05B84A : 0x172F49), 0);
+        lv_obj_set_style_border_color(s_iq_offset_buttons[i],
+                                      lv_color_hex(selected ? 0x70F09A : 0x7898B8), 0);
+        lv_obj_set_style_border_width(s_iq_offset_buttons[i], selected ? 3 : 1, 0);
+        lv_obj_set_style_text_color(s_iq_offset_buttons[i],
+                                    lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    }
+}
+
+void iq_sample_offset_button_event(lv_event_t *event) {
+    if (lv_event_get_code(event) != LV_EVENT_PRESSED) return;
+    const intptr_t encoded = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+    const int offset = static_cast<int>(encoded) - 1;
+    if (offset < -1 || offset > 1) return;
+    s_settings.iq_sample_offset = offset;
+    s_iq_sample_offset_requested.store(offset, std::memory_order_relaxed);
+    update_iq_offset_button_styles();
+    ESP_LOGI(TAG, "I/Q sample offset set to %+d (%s)", offset,
+             offset > 0 ? "delay I by approximately one sample" :
+             offset < 0 ? "delay Q by approximately one sample" : "no channel delay");
+    save_persistent_audio_settings();
 }
 
 void close_settings_panel() {
@@ -1951,15 +2182,8 @@ void settings_backdrop_tap_event(lv_event_t *event) {
     close_settings_panel();
 }
 
-void settings_done_event(lv_event_t *event) {
-    (void)event;
-    close_settings_panel();
-}
-
 void create_settings_panel(lv_obj_t *screen) {
-    // Transparent modal backdrop catches taps outside the panel. This lets a
-    // tap anywhere on the underlying panadapter close Settings without
-    // accidentally sending that tap to a chart or other screen control.
+    // Transparent modal backdrop: tapping outside Settings dismisses the panel.
     s_settings_backdrop = lv_obj_create(screen);
     lv_obj_remove_style_all(s_settings_backdrop);
     lv_obj_add_flag(s_settings_backdrop, LV_OBJ_FLAG_FLOATING);
@@ -1968,94 +2192,166 @@ void create_settings_panel(lv_obj_t *screen) {
     lv_obj_set_size(s_settings_backdrop, LV_PCT(100), LV_PCT(100));
     lv_obj_align(s_settings_backdrop, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_opa(s_settings_backdrop, LV_OPA_TRANSP, 0);
-    // Dismiss the panel on touch-down rather than waiting for finger release.
     lv_obj_add_event_cb(s_settings_backdrop, settings_backdrop_tap_event,
                         LV_EVENT_PRESSED, nullptr);
     lv_obj_add_flag(s_settings_backdrop, LV_OBJ_FLAG_HIDDEN);
 
     s_settings_panel = lv_obj_create(screen);
-    // Floating and centered over the main display. 75% width leaves a useful
-    // margin on both sides while providing substantially more slider space.
     lv_obj_add_flag(s_settings_panel, LV_OBJ_FLAG_FLOATING);
     lv_obj_set_size(s_settings_panel, LV_PCT(75), LV_PCT(98));
     lv_obj_align(s_settings_panel, LV_ALIGN_CENTER, 0, 0);
-    // Deep navy gradient, bright blue outline, and soft shadow to match the
-    // approved settings mockup rather than the former flat dialog.
-    lv_obj_set_style_bg_color(s_settings_panel, lv_color_hex(0x071A35), 0);
-    lv_obj_set_style_bg_grad_color(s_settings_panel, lv_color_hex(0x142F52), 0);
+    lv_obj_set_style_bg_color(s_settings_panel, lv_color_hex(0x061426), 0);
+    lv_obj_set_style_bg_grad_color(s_settings_panel, lv_color_hex(0x102D50), 0);
     lv_obj_set_style_bg_grad_dir(s_settings_panel, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_bg_opa(s_settings_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(s_settings_panel, lv_color_hex(0x78BFFF), 0);
+    lv_obj_set_style_border_color(s_settings_panel, lv_color_hex(0x269BFF), 0);
     lv_obj_set_style_border_width(s_settings_panel, 3, 0);
-    lv_obj_set_style_radius(s_settings_panel, 20, 0);
-    lv_obj_set_style_shadow_color(s_settings_panel, lv_color_hex(0x000814), 0);
-    lv_obj_set_style_shadow_width(s_settings_panel, 28, 0);
-    lv_obj_set_style_shadow_opa(s_settings_panel, LV_OPA_50, 0);
-    lv_obj_set_style_shadow_ofs_y(s_settings_panel, 8, 0);
-    lv_obj_set_style_pad_hor(s_settings_panel, 34, 0);
-    lv_obj_set_style_pad_ver(s_settings_panel, 16, 0);
-    lv_obj_set_style_pad_row(s_settings_panel, 4, 0);
+    lv_obj_set_style_radius(s_settings_panel, 18, 0);
+    lv_obj_set_style_pad_hor(s_settings_panel, 24, 0);
+    lv_obj_set_style_pad_ver(s_settings_panel, 12, 0);
+    lv_obj_set_style_pad_row(s_settings_panel, 10, 0);
     lv_obj_set_flex_flow(s_settings_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_settings_panel, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    // Fixed, compact control groups leave a dedicated footer for Done.
-    // Keep the panel non-scrollable so slider gestures remain unambiguous.
     lv_obj_clear_flag(s_settings_panel, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Panel title.
     lv_obj_t *title = lv_label_create(s_settings_panel);
-    lv_label_set_text(title, "DISPLAY & AUDIO SETTINGS");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFD400), 0);
-    lv_obj_set_style_text_font(title, APP_FONT_28, 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(title, "SETTINGS");
     lv_obj_set_width(title, LV_PCT(100));
-    lv_obj_set_style_text_letter_space(title, 2, 0);
-    lv_obj_set_style_pad_bottom(title, 0, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, APP_FONT_28, 0);
+    lv_obj_set_style_text_letter_space(title, 1, 0);
 
-    lv_obj_t *subtitle = lv_label_create(s_settings_panel);
-    lv_label_set_text(subtitle, "SIGNAL LEVELS  |  DISPLAY  |  AUDIO INPUT");
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x91B6D8), 0);
-    lv_obj_set_style_text_font(subtitle, APP_FONT_14, 0);
-    lv_obj_set_style_text_letter_space(subtitle, 1, 0);
-    lv_obj_set_width(subtitle, LV_PCT(100));
-    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    // Build the wide, horizontal slider rows used by the redesigned panel.
+    auto add_wide_slider = [&](lv_obj_t *section, const char *label, SettingId id,
+                               int min_value, int max_value, int initial_value,
+                               size_t index) {
+        lv_obj_t *row = lv_obj_create(section);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, 64);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 12, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    add_setting_slider(s_settings_panel, "PANADAPTER LOW LEVEL", SettingId::PanLow,
-                       -120, -20, s_settings.pan_low_db, 0);
-    add_setting_slider(s_settings_panel, "PANADAPTER HIGH LEVEL", SettingId::PanHigh,
-                       -80, 0, s_settings.pan_high_db, 1);
-    add_setting_slider(s_settings_panel, "WATERFALL LOW LEVEL", SettingId::WaterfallLow,
-                       -120, -20, s_settings.waterfall_low_db, 2);
-    add_setting_slider(s_settings_panel, "WATERFALL HIGH LEVEL", SettingId::WaterfallHigh,
-                       -80, 0, s_settings.waterfall_high_db, 3);
-    add_setting_slider(s_settings_panel, "AVERAGING TIME", SettingId::Averaging,
-                       0, 30, 5, 4);
-    add_setting_slider(s_settings_panel, "FREQUENCY DISPLAY WIDTH", SettingId::DisplayWidth,
-                       2, 48, s_settings.display_width_khz, 5);
-    add_setting_slider(s_settings_panel, "WATERFALL SPEED", SettingId::WaterfallSpeed,
-                       30, 60, s_settings.waterfall_speed_hz, 6);
-    add_setting_slider(s_settings_panel, "XONAR / UAC2 INPUT GAIN", SettingId::Uac2InputGain,
-                       0, 24, s_settings.uac2_input_gain_db, 7);
+        lv_obj_t *name = lv_label_create(row);
+        lv_label_set_text(name, label);
+        lv_obj_set_width(name, 190);
+        lv_obj_set_style_text_color(name, lv_color_hex(0xF2F7FF), 0);
+        lv_obj_set_style_text_font(name, APP_FONT_20, 0);
 
-    lv_obj_t *done = lv_button_create(s_settings_panel);
-    lv_obj_set_width(done, LV_PCT(100));
-    lv_obj_set_height(done, 52);
-    lv_obj_set_style_margin_top(done, 5, 0);
-    lv_obj_set_style_bg_color(done, lv_color_hex(0x0879E8), 0);
-    lv_obj_set_style_bg_grad_color(done, lv_color_hex(0x0054C8), 0);
-    lv_obj_set_style_bg_grad_dir(done, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_border_color(done, lv_color_hex(0x19A7FF), 0);
-    lv_obj_set_style_border_width(done, 2, 0);
-    lv_obj_set_style_radius(done, 16, 0);
-    lv_obj_set_style_shadow_color(done, lv_color_hex(0x00152F), 0);
-    lv_obj_set_style_shadow_width(done, 8, 0);
-    lv_obj_set_style_shadow_opa(done, LV_OPA_50, 0);
-    // Apply the Done action immediately when the user touches the button.
-    lv_obj_add_event_cb(done, settings_done_event, LV_EVENT_PRESSED, nullptr);
-    lv_obj_t *done_label = lv_label_create(done);
-    lv_label_set_text(done_label, "DONE");
-    lv_obj_set_style_text_color(done_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(done_label, APP_FONT_20, 0);
-    lv_obj_center(done_label);
+        lv_obj_t *slider = lv_slider_create(row);
+        lv_obj_set_flex_grow(slider, 1);
+        lv_obj_set_height(slider, 54);
+        lv_obj_set_ext_click_area(slider, 18);
+        lv_obj_set_style_bg_color(slider, lv_color_hex(0x526B88), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_height(slider, 12, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(slider, lv_color_hex(0x087BEE), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_height(slider, 12, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(slider, lv_color_hex(0xEAF5FF), LV_PART_KNOB);
+        lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_KNOB);
+        lv_obj_set_style_width(slider, 28, LV_PART_KNOB);
+        lv_obj_set_style_height(slider, 28, LV_PART_KNOB);
+        lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+        lv_slider_set_range(slider, min_value, max_value);
+        lv_slider_set_value(slider, initial_value, LV_ANIM_OFF);
+
+        lv_obj_t *value = lv_label_create(row);
+        lv_obj_set_width(value, 112);
+        lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(value, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(value, APP_FONT_20, 0);
+        s_setting_controls[index] = {id, value, slider};
+        lv_obj_add_event_cb(slider, setting_slider_event, LV_EVENT_VALUE_CHANGED,
+                            &s_setting_controls[index]);
+    };
+
+    auto make_section = [&](const char *heading, int height) {
+        lv_obj_t *section = lv_obj_create(s_settings_panel);
+        lv_obj_set_width(section, LV_PCT(100));
+        lv_obj_set_height(section, height);
+        lv_obj_set_style_bg_color(section, lv_color_hex(0x081B2D), 0);
+        lv_obj_set_style_bg_opa(section, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(section, lv_color_hex(0x69B9F5), 0);
+        lv_obj_set_style_border_width(section, 2, 0);
+        lv_obj_set_style_radius(section, 12, 0);
+        lv_obj_set_style_pad_hor(section, 16, 0);
+        lv_obj_set_style_pad_ver(section, 8, 0);
+        lv_obj_set_style_pad_row(section, 3, 0);
+        lv_obj_set_flex_flow(section, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(section, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(section, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *heading_label = lv_label_create(section);
+        lv_label_set_text(heading_label, heading);
+        lv_obj_set_width(heading_label, LV_PCT(100));
+        lv_obj_set_style_text_color(heading_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(heading_label, APP_FONT_20, 0);
+        return section;
+    };
+
+    // Section 1: shared spectrum/waterfall reference levels, span, and speed.
+    lv_obj_t *display_section = make_section("SPECTRUM / WATERFALL", 330);
+    add_wide_slider(display_section, "High Level", SettingId::PanHigh,
+                    -80, 0, s_settings.pan_high_db, 0);
+    add_wide_slider(display_section, "Low Level", SettingId::PanLow,
+                    -120, -20, s_settings.pan_low_db, 1);
+    add_wide_slider(display_section, "Span", SettingId::DisplayWidth,
+                    2, 48, s_settings.display_width_khz, 2);
+    add_wide_slider(display_section, "Waterfall Speed", SettingId::WaterfallSpeed,
+                    20, 60, s_settings.waterfall_speed_hz, 3);
+
+    // Section 2: signal processing controls and the three-way I/Q sample offset.
+    lv_obj_t *processing_section = make_section("SIGNAL PROCESSING", 250);
+    add_wide_slider(processing_section, "Averaging", SettingId::Averaging,
+                    0, 30, static_cast<int>(std::lround(s_settings.averaging_seconds * 10.0f)), 4);
+    add_wide_slider(processing_section, "Gain", SettingId::Uac2InputGain,
+                    0, 24, s_settings.uac2_input_gain_db, 5);
+
+    lv_obj_t *offset_row = lv_obj_create(processing_section);
+    lv_obj_remove_style_all(offset_row);
+    lv_obj_set_width(offset_row, LV_PCT(100));
+    lv_obj_set_height(offset_row, 48);
+    lv_obj_set_flex_flow(offset_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(offset_row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(offset_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *offset_label = lv_label_create(offset_row);
+    lv_label_set_text(offset_label, "I/Q Sample Offset");
+    lv_obj_set_width(offset_label, 190);
+    lv_obj_set_style_text_color(offset_label, lv_color_hex(0xF2F7FF), 0);
+    lv_obj_set_style_text_font(offset_label, APP_FONT_20, 0);
+
+    lv_obj_t *offset_group = lv_obj_create(offset_row);
+    lv_obj_remove_style_all(offset_group);
+    lv_obj_set_size(offset_group, 270, 46);
+    lv_obj_set_flex_flow(offset_group, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(offset_group, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(offset_group, LV_OBJ_FLAG_SCROLLABLE);
+    const char *offset_text[3] = {"-1", "0", "+1"};
+    for (int i = 0; i < 3; ++i) {
+        s_iq_offset_buttons[i] = lv_button_create(offset_group);
+        lv_obj_set_size(s_iq_offset_buttons[i], 78, 42);
+        lv_obj_set_style_radius(s_iq_offset_buttons[i], 8, 0);
+        lv_obj_set_style_bg_opa(s_iq_offset_buttons[i], LV_OPA_COVER, 0);
+        lv_obj_add_event_cb(s_iq_offset_buttons[i], iq_sample_offset_button_event,
+                            LV_EVENT_PRESSED,
+                            reinterpret_cast<void *>(static_cast<intptr_t>(i)));
+        lv_obj_t *button_label = lv_label_create(s_iq_offset_buttons[i]);
+        lv_label_set_text(button_label, offset_text[i]);
+        lv_obj_set_style_text_font(button_label, APP_FONT_20, 0);
+        lv_obj_set_style_text_color(button_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(button_label);
+    }
+    update_iq_offset_button_styles();
+
+    // No footer button: tap outside the panel to dismiss Settings.
 
     update_setting_value_labels();
     apply_display_settings();
@@ -2635,13 +2931,6 @@ extern "C" void app_main(void) {
             // from INA226 battery telemetry. Use that hardware status for the
             // icon; INA226 current direction is not a reliable charging flag.
             const bool charger_gpio = tab5.get_charging_status();
-            // Diagnostic: compare the dedicated CHG_STAT GPIO with the INA226's
-            // current-derived charging estimate. This helps determine whether
-            // the charger is active and which status source is reliable.
-            ESP_LOGI(TAG, "BATTERY DIAG: present=%d voltage=%.2f V current=%.0f mA "
-                         "power=%.0f mW CHG_STAT=%d INA_charging=%d",
-                     battery.is_present, battery.voltage_v, battery.current_ma,
-                     battery.power_mw, charger_gpio, battery.is_charging);
             if (s_top_battery_label) {
                 if (battery.is_present) {
                     char battery_text[32];
